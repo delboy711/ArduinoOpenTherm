@@ -49,10 +49,7 @@
 #define OTPERIOD (996) //used a little trick to find mine, see below in loop
 
 #define MAX_BOILER_TEMP (80)
-
-#define REPORTING_PERIOD (60)
-#define REPORTING_DELTA  (5)
-#define MAX_RF12_RETRY (50) //retry 50 times and then give up
+#define REPORTING_PERIOD (30000) // in milliseconds
 // xively.com feed
 #define FEED    "1927562856"
 #define APIKEY  "fU3LIV4DesLb8zHqnZG8int9HOtrzysRcfjGfNcvhp6FbLE7"
@@ -161,7 +158,8 @@ prog_char website[] PROGMEM = "api.xively.com";
 byte Ethernet::buffer[450];
 Stash stash;
 static byte session;
-
+unsigned long previousMillis = 0;
+unsigned long currentMillis;
 /* Timer2 reload value, globally available */
 unsigned int tcnt2;
 
@@ -179,12 +177,9 @@ boolean done = false;
 byte state = 0; //0 - start bit; 1 - message: 2 - stop bit
 byte output_pin = SLAVE_OUTPUT_PIN;
 
-int reporting_cycles = REPORTING_PERIOD;
-
 typedef struct {
   unsigned int house;
   unsigned int device;
-  unsigned int seq;
   byte temp;
   byte CHtemp;
   byte returntemp;
@@ -201,7 +196,6 @@ OpenThermData buf;
 typedef struct {
   unsigned int house;
   unsigned int device;
-  unsigned int seq;
   unsigned int burner_starts;
   unsigned int CH_pump_starts;
   unsigned int DHW_pump_starts;
@@ -256,7 +250,6 @@ void setup() {
  
   buf.house = 192;
   buf.device = 4;
-  buf.seq = 0;
   buf.temp = 0;
   buf.CHtemp = 0;
   buf.returntemp = 0;
@@ -268,7 +261,6 @@ void setup() {
   
   extbuf.house = 192;
   extbuf.device = 5;
-  extbuf.seq = 0;
   extbuf.burner_starts = 0;
   extbuf.CH_pump_starts = 0;
   extbuf.DHW_pump_starts = 0;
@@ -514,18 +506,11 @@ void loop() {
 //	 strcpy_P(lcd_status, oth_error);
     }
     
-// query the server every REPORTING_PERIOD cycles for the setpoint
-//    if (total_cycles == reporting_cycles || rf_success != 0)
-    if (total_cycles == reporting_cycles )
-    {
-      //send server data
-      total_cycles = 0;
-      buf.seq = buf.seq++;
-      
-//      if (error_reading_frame > 0) //comms error with the boiler
-//      {
-//        buf.boilerstatus = 250 + error_reading_frame;
-//      }
+// upload the data every REPORTING_PERIOD
+  currentMillis = millis();
+  if(currentMillis - previousMillis > REPORTING_PERIOD) {
+    previousMillis = currentMillis;
+
 
       // By using a separate stash,
       // we can determine the size of the generated message ahead of time
@@ -589,24 +574,11 @@ if (reply !=0){
 Serial.print("\nResponse received");
 }  
  
-      unsigned long ss;
-
-      ss = millis();
-
-
-      byte sss=CHAR_NOK;
-
-
     //HERE RESET CHTEMP, RETURNTEMP, BOILERSTATUS, TEMP
     buf.CHtemp = 0;
     buf.returntemp = 0;
     buf.boilerstatus = 0;
     buf.h2o = 0;
-
-//This delay should be adjusted to stay within the tolerances, even when the communicating failed    
-//    delay(850);
-    delay(50);  // shortened for testing dj
-    cycles++;
 
     done = false;
     StartInterrupts();
@@ -633,7 +605,6 @@ void copyframe() {
     output_pin = MASTER_OUTPUT_PIN;
   }
   uint32_t frame = OT.getFrame();
-  uint32_t frame_buff;
   MM4 = lowByte(frame);
   frame >>= 8; // strip off lowest byte
   MM3 = lowByte(frame);
@@ -641,40 +612,50 @@ void copyframe() {
   MM2 = lowByte(frame);
   frame >>= 8; // strip off lowest byte
   MM1 = frame;
+  
+  if (OT.getDataId() == 1) {    // Temp Control set point
+    if (OT.isMaster()) {
+      MM3 = 55;  // Force temp to 55 for testing
+      MM4 = 0;
+      parity();   // check parity
+    }
+   }
+    
+    
   // if ID=17 (modulation) change it to 28 (ret Temp)
   // controls always ask for modulation which boiler does not support
   // but never asks for return temp
   if (OT.getDataId() == 17 && OT.isMaster()) {
     MM2 = 28;            //set id type to returntemp
-    frame_buff = MM1 + (MM2 << 8) + (MM3 << 16) + (MM4 << 24);  //put the frame together
-       if ( parity(frame_buff)) {   // check parity
-	MM1 ^= B10000000;  // XOR the parity bit
-    }
+    parity();   // check parity
   }
   if (OT.getDataId() == 28 && !OT.isMaster()) {
     MM2 = 17;            //set id type back to modulation
     MM1 = B01110000;	// send data invalid
       //recalculate parity 
-  frame_buff = MM1 + (MM2 << 8) + (MM3 << 16) + (MM4 << 24);  //put the frame together
-  if ( parity(frame_buff)) {   // check parity
-      MM1 ^= B10000000;  // XOR the parity bit
-    }
+    parity();   // check parity
    }
-    
+  
   StartInterrupts();
 }
 
 
 
-unsigned char parity(uint32_t ino) {
+unsigned char parity() {
   
   unsigned char noofones = 0; 
+  uint32_t ino = MM4 + (MM3 << 8) + ((uint32_t)MM2 << 16) + ((uint32_t)MM1 << 24);  //put the frame together
+
   while(ino != 0) 
   { 
     noofones++; 
     ino &= (ino-1); // the loop will execute once for each bit of ino set
   } 
-  /* if noofones is odd, least significant bit will be 1 */ 
+
+  if (noofones & 1) { 
+    MM1 ^= B10000000;  // XOR the parity bit
+  }
+   /* if noofones is odd, least significant bit will be 1 */ 
   return (noofones & 1); 
 }
 
@@ -732,6 +713,9 @@ Serial.println(data_value);
 //    Serial.println((byte)t);
     break;
   case 1:  // Control setpoint
+    if (OT.isMaster()) { // only interested in slave status
+      break;
+    }
     t = data_value / 256;  // don't care about decimal values
     buf.temp = (byte)t;
 //    Serial.print("set burner to ");
@@ -739,11 +723,11 @@ Serial.println(data_value);
 //    Serial.println("C");
     break;
   case 3:  //slave configs
-    Serial.println("slave flags OK    ");
+//    Serial.println("slave flags OK    ");
     break;
 
   case 5:  //faults water and flame
-    Serial.println("faults flags OK    ");
+//    Serial.println("faults flags OK    ");
     break;
     
   case 14:  //max modulation
@@ -763,10 +747,10 @@ Serial.println(data_value);
     break;
   case 18:  //water pressure
     buf.h2o = data_value;
-    Serial.print("H2O press: ");
-    Serial.print(highByte(buf.h2o));
-    Serial.print(".");
-    Serial.println(lowByte(buf.h2o)*100/256);
+//    Serial.print("H2O press: ");
+//    Serial.print(highByte(buf.h2o));
+//    Serial.print(".");
+//    Serial.println(lowByte(buf.h2o)*100/256);
     break;
    case 20:  //Date-Time
     t = data_value / 256;  // don't care about decimal values
@@ -792,9 +776,9 @@ Serial.println(data_value);
    case 28:  //return temp
     t = data_value / 256;  // don't care about decimal values
     buf.returntemp = max(buf.returntemp, byte(t));
-    Serial.print("ret temp: ");
-    Serial.print(t);
-    Serial.println(" ");
+//    Serial.print("ret temp: ");
+//    Serial.print(t);
+//    Serial.println(" ");
     break;
   case 116:  //burner starts
     ut = (unsigned int)data_value;  // don't care about decimal values
@@ -806,23 +790,23 @@ Serial.println(data_value);
   case 117:  //CH pump starts
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.CH_pump_starts = ut;
-    Serial.print("CH pump st: ");
-    Serial.print(ut);
-    Serial.println("     ");
+//    Serial.print("CH pump st: ");
+//    Serial.print(ut);
+//    Serial.println("     ");
     break;
   case 118:  //DHW starts
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.DHW_pump_starts = ut;
-    Serial.print("DHW st: ");
-    Serial.print(ut);
-    Serial.println("     ");
+//    Serial.print("DHW st: ");
+//    Serial.print(ut);
+//    Serial.println("     ");
     break;
   case 119:  //DHW burner starts
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.DHW_burner_starts = ut;
-    Serial.print("DHW bur st: ");
-    Serial.print(ut);
-    Serial.println("     ");
+//    Serial.print("DHW bur st: ");
+//    Serial.print(ut);
+//    Serial.println("     ");
     break;
   case 120:  //burner hours
     ut = (unsigned int)data_value;  // don't care about decimal values
