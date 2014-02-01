@@ -1,2 +1,27 @@
-The individual OT encoder and decoder should be working
-The OT_encoder_decoder is not functional and not complete!!!
+This Arduino script is for a gateway device to sit between a boiler supporting the OpenTherm protocol, and a smart central heating controller also supporting OpenTherm.
+
+The device logs all messages vetween the boiler and controller and uploads them to a cloud logging store (www.xively.com) for statistical analysis. 
+
+It also allows the messaged between the boiler and controller to be manipulated so the controls can be overridden either by a decision made by a local control algorithm on the Arduino, or else remotely via the network connection.
+
+The motivation for me in building it was because the Remaha iSense controls I had made some weird decisions baout what temperature to set my Intergas boiler to which meant the boiler was making far more ignition starts than it needed to, and the house took too long to reach the target temperature.
+
+Hardware used is :-
+Anduino Uno Rev 3
+Ethernet module ENC28J60
+Voltage step up module (needed for 24V supply)
+Custom OptiTherm gateway shield for Arduino based on PIC gateway shield.
+
+Status
+-----
+The hardware and code is functional and the Arduino is busy logging data to xilvely.com. Some messages between the boiler and controls are being manipulated. Next step is to set my own control set points.
+
+
+
+
+Credits
+-------
+Fabian at http://otgw.tclcode.com/  for the OpenTherm PIC gateway schematic.
+Martijn van den Burg for the OpenTherm library http://palebluedot.nl/jml/projects/arduino/24-openthermmon
+Amvv at http://jaagpad.blogspot.co.uk/2011/09/opentherm-code-repository.html  for the framework of the code.
+
