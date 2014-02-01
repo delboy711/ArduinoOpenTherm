@@ -1,15 +1,21 @@
 /*
- * OpenTherm encoder, by AMVV 
- * based on a work by: Sebastian Wallin
+ * OpenTherm encoder, by Derek Jennings 
+ * based on works by: AMVV and Sebastian Wallin
  * description:
  * Example on opentherm communication
  *
  * This OT encoder implements a manchester encoder, which transmits a bit every 1ms,
  * so it fires every 0.5ms to make a transition.
  * it is not very clean code...
- * It communicates with the boiler, sends set points.
+ * It listens to frames coming from the boiler(master) and thermostat(slave) and forwards them on when in monitor mode.
+ * In control mode it intercepts boiler set point frames from the master and substitutes its own estimation of what the boiler set point should be.
+ * It uploads statistical data over Ethernet to a data logging service (xively.com)
  * It communicates with the server to get a setpoint.
  * It sets the boiler to the received setpoint.
+ * Hardware required is
+ * 	Arduino Uno - or equivalent
+ *	Ethernet module 
+ *	Opentherm gateway circuit 
  *
  * TODO:
  * - Clean up the code
@@ -29,21 +35,27 @@
  *
  * - now also receives the age of the set point, in seconds, which it uses to synchronise such as to ask for date soon after the calculation
  */
-
+#include <MemoryFree.h>
 #include <OpTh.h>
-#include <PortsLCD.h>
-#include <RF12.h> // needed to avoid a linker error :(
+//#include <PortsLCD.h>
+#include <EtherCard.h>
 #include <util/parity.h>
-
-#define OUTPUT_PIN (4)//for use with JeeNodeUSB
-#define OTPERIOD (997) //used a little trick to find mine, see below in loop
+/* Include the U8glib library */
+#include "U8glib.h"
+/* Define the SPI Chip Select pin */
+#define CS_PIN 10
+#define MASTER_OUTPUT_PIN (4)
+#define SLAVE_OUTPUT_PIN (5)
+#define OTPERIOD (996) //used a little trick to find mine, see below in loop
 
 #define MAX_BOILER_TEMP (80)
 
 #define REPORTING_PERIOD (60)
 #define REPORTING_DELTA  (5)
 #define MAX_RF12_RETRY (50) //retry 50 times and then give up
-
+// xively.com feed
+#define FEED    "1927562856"
+#define APIKEY  "fU3LIV4DesLb8zHqnZG8int9HOtrzysRcfjGfNcvhp6FbLE7"
 //CHARACTER DEFINITIONS
 
 #define CHAR_CH    (0)
@@ -133,6 +145,23 @@ byte OTH[8] =
   B11111
 };
 
+// LCD strings
+prog_char bad_data[] PROGMEM = "bad data";
+prog_char par_error[] PROGMEM = "par err";
+prog_char ss_error[] PROGMEM = "ss err";
+prog_char frame_ok[] PROGMEM = "OK";
+prog_char oth_error[] PROGMEM = "oth err";
+char lcd_status[9];
+
+// ethernet interface mac address, must be unique on the LAN
+byte mymac[] = { 0x74,0x69,0x69,0x2D,0x33,0x9 };
+
+//char website[] PROGMEM = "api.xively.com";
+prog_char website[] PROGMEM = "api.xively.com";
+byte Ethernet::buffer[450];
+Stash stash;
+static byte session;
+
 /* Timer2 reload value, globally available */
 unsigned int tcnt2;
 
@@ -148,6 +177,7 @@ byte flame = false;
 byte bit_out = HIGH;
 boolean done = false;
 byte state = 0; //0 - start bit; 1 - message: 2 - stop bit
+byte output_pin = SLAVE_OUTPUT_PIN;
 
 int reporting_cycles = REPORTING_PERIOD;
 
@@ -159,6 +189,10 @@ typedef struct {
   byte CHtemp;
   byte returntemp;
   byte boilerstatus;
+  int roomtemp;
+  int roomset;
+  int outtemp;
+  int h2o;
 } 
 OpenThermData;
 
@@ -185,40 +219,41 @@ OpenThermExtendedData extbuf;
 byte MM1, MM2, MM3, MM4 = 0;
 
 OpTh OT = OpTh();  // create new OpTh class instance
-PortI2C myI2C (3);
-LiquidCrystalI2C lcd (myI2C);
 
-byte rf_success = 0;
+/* Create an instance of the library for the 12864 LCD in SPI mode */
+// use software SPI to avoid conflict with Ethercard
+U8GLIB_ST7920_128X64_1X u8g(7, 6, 10);
+
 
 /* Setup phase: configure and enable timer2 overflow interrupt */
 void setup() {
+  // assign default color value
+  
+  // assign output pins
+  pinMode( MASTER_OUTPUT_PIN, OUTPUT);
+  pinMode( SLAVE_OUTPUT_PIN, OUTPUT);
+    
+  Serial.begin(57600);
+  Serial.print("freeMemory()=");
+  Serial.println(freeMemory()); 
+  // Set up Ethernet
+      
+  if (ether.begin(sizeof Ethernet::buffer, mymac) == 0) 
+    Serial.println( "Failed to access Ethernet controller");
+  if (!ether.dhcpSetup())
+    Serial.println("DHCP failed");
 
-  rf12_initialize(10, RF12_868MHZ, 212);
-  //Serial.begin(19200);
-  lcd.createChar(CHAR_CH,CH);
-  lcd.createChar(CHAR_DHW,DHW);
-  lcd.createChar(CHAR_RF,RF);
-  lcd.createChar(CHAR_FLAME,FLAME);
-  lcd.createChar(CHAR_OT,OTH);
-  lcd.createChar(CHAR_OK,OK);
-  lcd.createChar(CHAR_NOK,NOK);
+  ether.printIp("IP:  ", ether.myip);
+  ether.printIp("GW:  ", ether.gwip);  
+  ether.printIp("DNS: ", ether.dnsip);  
 
-  /* Configure the test pin as output */
-  pinMode(OUTPUT_PIN, OUTPUT); 
+  if (!ether.dnsLookup(website))
+    Serial.println("DNS failed");
+    
+  ether.printIp("SRV: ", ether.hisip);
+  
 
-  lcd.begin(16, 2);
-  lcd.backlight();
-
-  // Print a message to the LCD.
-
-  lcd.write(CHAR_RF);
-  lcd.write(CHAR_OT);
-  lcd.write(CHAR_FLAME);
-  lcd.write(CHAR_CH);
-  lcd.write(CHAR_DHW);
-
-  lcd.print(" Ti To Ts");
-
+ 
   buf.house = 192;
   buf.device = 4;
   buf.seq = 0;
@@ -226,6 +261,10 @@ void setup() {
   buf.CHtemp = 0;
   buf.returntemp = 0;
   buf.boilerstatus = 0;
+  buf.roomset = 0;
+  buf.roomtemp = 0;
+  buf.outtemp = 0;
+  buf.h2o = 0;
   
   extbuf.house = 192;
   extbuf.device = 5;
@@ -239,7 +278,6 @@ void setup() {
   extbuf.DHW_pump_hours = 0;
   extbuf.DHW_burner_hours = 0;
  
-  rf12_sleep(0);
 
   OT.init();
   OT.setPeriod(OTPERIOD);
@@ -387,7 +425,7 @@ ISR(TIMER2_OVF_vect) {
   }
 
 
-  digitalWrite(OUTPUT_PIN, !y);
+  digitalWrite(output_pin, !y);
   //if (logic_transition == true)
   //Serial.print(y, DEC);
 
@@ -411,7 +449,7 @@ ISR(TIMER2_OVF_vect) {
   }
   if (bits_sent == 68) //(sizeof(MM)*8*2 + 4))
   {
-    digitalWrite(OUTPUT_PIN, HIGH);
+    digitalWrite(output_pin, HIGH);
     done = true;
     bits_sent = 0;
     StopInterrupts();
@@ -428,7 +466,14 @@ int error_reading_frame;
 
 /* Main loop.*/
 void loop() {
-
+ // picture loop  refreshes LCD screen
+// u8g.firstPage();  
+// do {
+//   draw();  // refresh LCD screen
+//} while( u8g.nextPage() );
+    
+   
+  ether.packetLoop(ether.packetReceive());
   if (done == true)
   {
     total_cycles++;
@@ -437,306 +482,209 @@ void loop() {
 
     //uncomment the cycle below to get the measurement of the OT period, then adapt the #define above, and comment it again...
 
-    //    if(total_cycles == 10)
-    //    {    
-    //      lcd.setCursor(0, 1);
-    //      lcd.print("measuring");
-    //      OT.measureOtPeriod();
-    //      lcd.setCursor(0, 1);
-    //      int perper = OT.getPeriod();
-    //      lcd.print(perper);
-    //      lcd.print("us");
-    //    }
-
-    lcd.setCursor(1, 1);
-    if (error_reading_frame == 1)
-    {
-      lcd.print("1");//bad data");
+//        if(total_cycles == 11)
+//        {    
+//          Serial.print("measuring");
+//          OT.measureOtPeriod();
+//          int perper = OT.getPeriod();
+//          Serial.print(perper);
+//          Serial.print("us");
+//        }
+    switch(error_reading_frame) {
+  case 1:  
+	Serial.print("1");//bad data");
+//      strcpy_P(lcd_status, bad_data);   
+      break;
+  case 2:
+        Serial.print("2");//ss bit error");
+	strcpy_P(lcd_status, ss_error);
+	break;
+  case 3:
+        Serial.print("3");//parity error");
+//	strcpy_P(lcd_status, par_error);   
+	break;
+  case 0:    // good frame
+    	copyframe();   // copy frame to other interface
+        display_frame();
+//	Serial.print("OK");
+//	strcpy_P(lcd_status, frame_ok);
+	break;
+  default:
+	 Serial.print("9");//other error");
+//	 strcpy_P(lcd_status, oth_error);
     }
-    else
-      if (error_reading_frame == 2)
-      {
-        lcd.print("2");//ss bit error");
-      }
-      else
-        if (error_reading_frame == 3)
-        {
-          lcd.print("3");//parity error");
-        }
-        else
-          if (error_reading_frame == 0)
-          {
-            lcd.write(CHAR_OK);//OK:        ");
-            display_frame();
-          }
-          else
-          {
-            lcd.print("9");//other error");
-          }
-
-    // Serial.println(total_cycles);
-    // query the server every REPORTING_PERIOD cycles for the setpoint
-    if (total_cycles == reporting_cycles || rf_success != 0)
+    
+// query the server every REPORTING_PERIOD cycles for the setpoint
+//    if (total_cycles == reporting_cycles || rf_success != 0)
+    if (total_cycles == reporting_cycles )
     {
-      //send radio data
+      //send server data
       total_cycles = 0;
       buf.seq = buf.seq++;
       
-      if (error_reading_frame > 0) //comms error with the boiler
+//      if (error_reading_frame > 0) //comms error with the boiler
+//      {
+//        buf.boilerstatus = 250 + error_reading_frame;
+//      }
+
+      // By using a separate stash,
+      // we can determine the size of the generated message ahead of time
+      stash.cleanup();
+      byte sd = stash.create();
+      if (buf.temp > 0) 
       {
-        buf.boilerstatus = 250 + error_reading_frame;
+	stash.print("burner_temp,");
+	stash.println(buf.temp);
       }
+      if (buf.CHtemp > 0) 
+      {
+	stash.print("CHtemp,");
+	stash.println(buf.CHtemp);
+      }
+      if (buf.returntemp > 0) 
+      {
+	stash.print("returntemp,");
+	stash.println(buf.returntemp);
+      }
+      stash.print("CH,");
+      stash.println((buf.boilerstatus & B00000010) >> 1);
+      stash.print("DHW,");
+      stash.println((buf.boilerstatus & B00000100) >> 2);      
+      if (buf.roomset > 0) 
+      {
+	prepareStash("set_temp,", buf.roomset);
+      }
+      if (buf.roomtemp > 0) 
+      {
+	prepareStash("temp,", buf.roomtemp);
+      }
+       if (buf.outtemp > 0) 
+      {
+	prepareStash("out_temp,", buf.outtemp);
+      }     
+       if (buf.h2o > 0) 
+      {
+	prepareStash("H2O,", buf.h2o);
+      }     
+
+      stash.save();
+    
+      // generate the header with payload - note that the stash size is used,
+      // and that a "stash descriptor" is passed in as argument using "$H"
+      Stash::prepare(PSTR("PUT http://$F/v2/feeds/$F.csv HTTP/1.0" "\r\n"
+                          "Host: $F" "\r\n"
+                          "X-ApiKey: $F" "\r\n"
+                          "Content-Length: $D" "\r\n"
+                          "\r\n"
+                          "$H"),
+              website, PSTR(FEED), website, PSTR(APIKEY), stash.size(), sd);
+
+      // send the packet - this also releases all stash buffers once done
+      session = ether.tcpSend();  
+  
       
-      rf12_sleep(-1);
-      while (!rf12_canSend())  // wait until sending is allowed
-          rf12_recvDone();
+    const char* reply = ether.tcpReply(session);
+if (reply !=0){
 
-      rf12_sendStart(0, &buf, sizeof buf);
-      while (!rf12_canSend())	// wait until sending has been completed
-          rf12_recvDone();
-
-      delay(5);
-      //lcd.print("sent!");
-
+Serial.print("\nResponse received");
+}  
+ 
       unsigned long ss;
 
       ss = millis();
 
 
-      rf_success = rf_success++;
       byte sss=CHAR_NOK;
 
-      //wait 300 miliseconds for a reply from the server. If none comes, go on, and retry in the next cycle
-      while (millis() - ss < 300)
-      {  
-        if (rf12_recvDone())
-        {
-          if (rf12_crc == 0)
-          {        
-            //lcd.print("OK");
-            //lcd.print((int)rf12_buf[9]);
-            if (rf12_buf[5] == 4) //received a pack from the boiler controller
-            {
-              sss=CHAR_OK;
-              rf_success = 0;
-              buf.temp = min(rf12_buf[9], MAX_BOILER_TEMP);
-              reporting_cycles = REPORTING_PERIOD + REPORTING_DELTA - rf12_buf[10];
-              reporting_cycles = max(10, reporting_cycles);
-              reporting_cycles = min(70, reporting_cycles);
-    lcd.setCursor(14,0);
-    lcd.print(reporting_cycles);
 
-              //HERE RESET CHTEMP, RETURNTEMP, BOILERSTATUS, TEMP
-              buf.CHtemp = 0;
-              buf.returntemp = 0;
-              buf.boilerstatus = 0;
-              //break;
-            }
-          }
-        }
-      }//while
-      lcd.setCursor(0,1);
-      lcd.print(sss);
+    //HERE RESET CHTEMP, RETURNTEMP, BOILERSTATUS, TEMP
+    buf.CHtemp = 0;
+    buf.returntemp = 0;
+    buf.boilerstatus = 0;
+    buf.h2o = 0;
 
-
-      rf12_sleep(0);
-
-      if (rf_success == MAX_RF12_RETRY)
-      {
-        rf_success = 0;
-        buf.temp = 0;
-      }
-      //lcd.setCursor(14,0);
-      //lcd.print((int)buf.temp);
-    }
-    //REMOVED, this will never happen...not very interesting data yet
-    //send extended data once every 60000 cycles 
-    //if ((total_cycles%36000) == 100)
-    //{
-    //  //send radio data
-
-    //  extbuf.seq = extbuf.seq++;
-    //  rf12_sleep(-1);
-    //  while (!rf12_canSend())	// wait until sending is allowed
-    //      rf12_recvDone();
-
-    //  rf12_sendStart(0, &extbuf, sizeof extbuf);
-    //  while (!rf12_canSend())	// wait until sending has been completed
-    //      rf12_recvDone();
-
-    //  delay(5);
-    //  //lcd.print("sent!");
-
-    //  rf12_sleep(0);
-    //}
-
-    //This delay should be adjusted to stay within the tolerances, even when the communicating failed    
-    delay(850);
-
+//This delay should be adjusted to stay within the tolerances, even when the communicating failed    
+//    delay(850);
+    delay(50);  // shortened for testing dj
     cycles++;
-//    lcd.setCursor(15,1);
-//    lcd.print(cycles);
-    lcd.setCursor(14,1);
-    lcd.print(total_cycles);
 
-    if (cycles == 1) //enable CH
-    {
-      if (buf.temp == 0)
-      { //no demand or comms error
-        MM1=0x80;//parity is 0
-        MM2=0x00;//0 bit set
-        MM3=0x02;//DHW enabled, but no CH enabled!!!!!
-        MM4=0x00;
-      }
-      else
-// The "if/else" comented here is to switch off the circulation pump when it reaches the target.
-// however, this leads to longer times to cool down the circulation water and retriggering the heating
-// should be better arranged such that the pump can be switched off after a bit, but garanteeing that water
-// will still circulate.
-//
-        if (buf.temp > buf.returntemp + 2 or flame == true or buf.temp < buf.returntemp) // this piece of logic should be properly debugged
-        {//there is demand
-          MM1=0x00;//parity is 0
-          MM2=0x00;//0 bit set
-          MM3=0x03;//DHW and CH enabled!!!!!
-          MM4=0x00;
-        }
-        else
-        { //no demand or comms error
-          MM1=0x80;//parity is 1
-          MM2=0x00;//0 bit set
-          MM3=0x02;//DHW enabled, but no CH enabled!!!!!
-          MM4=0x00;
-        }      
-    }
-
-    if (cycles == 2) //set water temp to 38 degress ADJUST TO RECEIVED TEMPERATURE AND PARITY
-    {
-      MM1=0x10;//no parity bit set
-      MM2=0x01;
-      MM3=buf.temp;
-      MM4=0x00;
-
-      byte par = parity_even_bit(MM3);
-      MM1 = MM1+8*par;
-    }
-    //other messages to try out
-    if (cycles == 3) // ID 25 - CH water temperature
-    {
-      MM1=0x80;
-      MM2=0x19;
-      MM3=0x00;
-      MM4=0x00;
-    }
-    if (cycles == 4) // ID 28 - return water temperature
-    {
-      MM1=0x80;
-      MM2=0x1C;
-      MM3=0x00;
-      MM4=0x00;
-    }
-
-    if (cycles == 5) // less frequent messages
-    {
-      inner_cycles++;
-      if (inner_cycles == 1) // ID  5 - faults in water pressure and flame
-      {
-        MM1=0x00;
-        MM2=0x05;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 2) // ID 26 - DHW temp
-      {
-        MM1=0x80;
-        MM2=0x1A;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 3) // ID 116 - burner starts
-      {
-        MM1=0x00;
-        MM2=0x74;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 4) // ID 117 - CH pump starts
-      {
-        MM1=0x80;
-        MM2=0x75;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 5) // ID 118 - DHW pump starts/valve starts
-      {
-        MM1=0x80;
-        MM2=0x76;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 6) // ID 119 - DHW burner starts
-      {
-        MM1=0x00;
-        MM2=0x77;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 7) // ID 120 - burner hours
-      {
-        MM1=0x00;
-        MM2=0x78;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 8) // ID 121 CH pump hours
-      {
-        MM1=0x80;
-        MM2=0x79;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 9) // ID 122 - DHW pump/valve hours
-      {
-        MM1=0x80;
-        MM2=0x7A;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      if (inner_cycles == 10) // ID 123 DHW burner hours
-      {
-        MM1=0x00;
-        MM2=0x7B;
-        MM3=0x00;
-        MM4=0x00;
-        //in the last message reset cycles
-        inner_cycles = 0;
-      }
-      if (inner_cycles == 11) // ID  3 - slave config flags
-      {
-        MM1=0x00;
-        MM2=0x03;
-        MM3=0x00;
-        MM4=0x00;
-      }
-      cycles = 0;
-    }
-
-    //    lcd.setCursor(13, 1);
-    //    lcd.print(total_cycles);
-
-
-    //Serial.println();
     done = false;
-    //check radio
-    //wait for message from boiler  
-    //decide on message
-    //Serial.print(millis());
-    //Serial.print(" - ");
-    //Serial.print(originalvalue);
-    //Serial.print(" - ");
     StartInterrupts();
+  
+   }
   }
+}  // end main loop
+
+
+//Draw LCD screen
+void draw() {
+  u8g.setFont(u8g_font_unifont);
+  u8g.drawStr( 0, 10, lcd_status);
 }
+
+
+// copy frame from master to slave or vice versa
+void copyframe() {
+  if (OT.isMaster()) {
+    output_pin = SLAVE_OUTPUT_PIN;
+  }
+  else
+  {
+    output_pin = MASTER_OUTPUT_PIN;
+  }
+  uint32_t frame = OT.getFrame();
+  uint32_t frame_buff;
+  MM4 = lowByte(frame);
+  frame >>= 8; // strip off lowest byte
+  MM3 = lowByte(frame);
+  frame >>= 8; // strip off lowest byte
+  MM2 = lowByte(frame);
+  frame >>= 8; // strip off lowest byte
+  MM1 = frame;
+  // if ID=17 (modulation) change it to 28 (ret Temp)
+  // controls always ask for modulation which boiler does not support
+  // but never asks for return temp
+  if (OT.getDataId() == 17 && OT.isMaster()) {
+    MM2 = 28;            //set id type to returntemp
+    frame_buff = MM1 + (MM2 << 8) + (MM3 << 16) + (MM4 << 24);  //put the frame together
+       if ( parity(frame_buff)) {   // check parity
+	MM1 ^= B10000000;  // XOR the parity bit
+    }
+  }
+  if (OT.getDataId() == 28 && !OT.isMaster()) {
+    MM2 = 17;            //set id type back to modulation
+    MM1 = B01110000;	// send data invalid
+      //recalculate parity 
+  frame_buff = MM1 + (MM2 << 8) + (MM3 << 16) + (MM4 << 24);  //put the frame together
+  if ( parity(frame_buff)) {   // check parity
+      MM1 ^= B10000000;  // XOR the parity bit
+    }
+   }
+    
+  StartInterrupts();
+}
+
+
+
+unsigned char parity(uint32_t ino) {
+  
+  unsigned char noofones = 0; 
+  while(ino != 0) 
+  { 
+    noofones++; 
+    ino &= (ino-1); // the loop will execute once for each bit of ino set
+  } 
+  /* if noofones is odd, least significant bit will be 1 */ 
+  return (noofones & 1); 
+}
+
+void prepareStash( char txt[], int dat) {
+  stash.print(txt);
+  stash.print(highByte(dat));
+  stash.print(".");
+  stash.println(lowByte(dat)*100/256);  
+}
+
 
 void display_frame() {
   byte msg_type = OT.getMsgType();
@@ -744,188 +692,177 @@ void display_frame() {
   unsigned int data_value = OT.getDataValue();
 
   unsigned int ut;
-  int t;
-  float f;
+  unsigned int t;
+Serial.print("from ");
+if (OT.isMaster()) {
+  Serial.print("master ");
+} else {
+  Serial.print("slave  ");
+}
+Serial.print("   type ");
+Serial.print(msg_type);
+Serial.print("   data ID ");
+Serial.print(data_id);
+Serial.print("   data value ");
+Serial.println(data_value);
 
 
   switch(data_id) {
   case 0:  // status
-    if (data_value & 4) {  // perform bitmasking on status frame
-      lcd.setCursor(3,1);
-      lcd.print(" ");//DHW
-      lcd.write(CHAR_OK);
+    if (OT.isMaster()) { // only interested in slave status
+      break;
     }
-    else if (data_value & 2) {
-      lcd.setCursor(3,1);
-      lcd.write(CHAR_OK);
-      lcd.print(" ");//CH
-      //lcd.print(temp_set_to);
-    }
-    else {
-      lcd.setCursor(3,1);
-      lcd.print("  ");
-    }
-
-    if (data_value & 8) {
-      lcd.setCursor(2,1);
-      lcd.write(CHAR_OK);
-      //lcd.print("!");//FLAME
+    t = lowByte(data_value);
+//    if (t & B00000010) {  // perform bitmasking on status frame
+//      Serial.print("CH active   ");//CH
+//    }
+//    if (t & B00000100) {  
+//      Serial.print("DHW active   ");//DHW
+//    }
+    if (t & B00001000) {
+//      Serial.println("flame! ");//FLAME
       flame = true;
     }
     else {
-      lcd.setCursor(2,1);
-      lcd.print(" ");
+//      Serial.println("no flame ");
       flame = false;
     }
-    buf.boilerstatus = max(buf.boilerstatus, (byte)data_value);
+    buf.boilerstatus = buf.boilerstatus | t;  // OR the current status with previous status in this reporting period
+//    Serial.print("Status ");
+//    Serial.println((byte)t);
     break;
   case 1:  // Control setpoint
     t = data_value / 256;  // don't care about decimal values
     buf.temp = (byte)t;
-    lcd.setCursor(12,1);
-    //lcd.print("set burner to ");
-    lcd.print(t);
-    lcd.print(" ");
-    //lcd.print("C");
+//    Serial.print("set burner to ");
+//    Serial.print(t);
+//    Serial.println("C");
     break;
   case 3:  //slave configs
-    //lcd.print("slave flags OK    ");
+    Serial.println("slave flags OK    ");
     break;
 
   case 5:  //faults water and flame
-    //lcd.print("faults flags OK    ");
+    Serial.println("faults flags OK    ");
     break;
+    
+  case 14:  //max modulation
+  case 17:  //modulation level not reported
+  case 19:  //DHW flow rate
+  case 26:  //DHW temp - does not get reported properly in my boiler AMVV
+  case 33:  //exhaust temp
+    break;    
 
   case 16:  // room setpoint
-    f = (float)data_value / 256;
-    //lcd.print("room set to ");
-    //lcd.print(f);
-    if (data_value % 256 == 0) {
-      //lcd.print("C");
-    }
-    //lcd.print("     ");
-    break;
-  case 17:  //modulation level
-    t = data_value / 256;  // don't care about decimal values
-    //lcd.print("modul: ");
-    //lcd.print(t);
-    //lcd.print("     ");
+    buf.roomset = data_value;
+//    Serial.print("room set to ");
+//    Serial.print(highByte(buf.roomset));
+//    Serial.print(".");
+//    Serial.print(lowByte(buf.roomset)*100/256);
+//    Serial.println("C");
     break;
   case 18:  //water pressure
-    t = data_value / 256;  // don't care about decimal values
-    //lcd.print("H20 press: ");
-    //lcd.print(t);
-    //lcd.print("     ");
+    buf.h2o = data_value;
+    Serial.print("H2O press: ");
+    Serial.print(highByte(buf.h2o));
+    Serial.print(".");
+    Serial.println(lowByte(buf.h2o)*100/256);
     break;
-  case 19:  //DHW flow rate
+   case 20:  //Date-Time
     t = data_value / 256;  // don't care about decimal values
-    //lcd.print("DHW rate: ");
-    //lcd.print(t);
-    //lcd.print("     ");
-    break;
+    Serial.print("Date ");
+    Serial.print(data_value);
+    Serial.println("     ");
+    break;   
   case 25:  //CH temp
+    if (OT.isMaster()) { // only interested in slave status
+      break;
+    }
     t = data_value / 256;  // don't care about decimal values
     buf.CHtemp = max(buf.CHtemp, (byte)t);
-    lcd.setCursor(6,1);
-    //lcd.print("CH temp: ");
-    if (t<10)
-    {
-      lcd.print(" ");
-    }
-    lcd.print(t);
-    lcd.print(" ");
+//    Serial.print("CH temp: ");
+//    Serial.print(t);
+//    Serial.println(" ");
     break;
-  case 26:  //DHW temp - does not get reported properly in my boiler AMVV
-    t = data_value / 256;  // don't care about decimal values
-    //buf.CHtemp = (byte)t;
-    //lcd.setCursor(6,1);
-    //lcd.print("DHW temp: ");
-    //lcd.print(t);
-    //lcd.print(" ");
-    break;
-  case 28:  //return temp
+   case 27:  //outside temp
+    buf.outtemp = data_value;  
+//    Serial.print("outside temp: ");
+//    Serial.println(highByte(buf.outtemp));
+    break;   
+   case 28:  //return temp
     t = data_value / 256;  // don't care about decimal values
     buf.returntemp = max(buf.returntemp, byte(t));
-    lcd.setCursor(9,1);
-    //lcd.print("ret temp: ");
-    lcd.print(t);
-    lcd.print(" ");
-    break;
-  case 33:  //exhaust temp
-    t = data_value / 256;  // don't care about decimal values
-    //lcd.print("exh temp: ");
-    //lcd.print(t);
-    //lcd.print("     ");
+    Serial.print("ret temp: ");
+    Serial.print(t);
+    Serial.println(" ");
     break;
   case 116:  //burner starts
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.burner_starts = ut;
-    //lcd.print("bur st: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+//    Serial.print("bur st: ");
+//    Serial.print(ut);
+//    Serial.println("     ");
     break;
   case 117:  //CH pump starts
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.CH_pump_starts = ut;
-    //lcd.print("CH pump st: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+    Serial.print("CH pump st: ");
+    Serial.print(ut);
+    Serial.println("     ");
     break;
   case 118:  //DHW starts
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.DHW_pump_starts = ut;
-    //lcd.print("DHW st: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+    Serial.print("DHW st: ");
+    Serial.print(ut);
+    Serial.println("     ");
     break;
   case 119:  //DHW burner starts
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.DHW_burner_starts = ut;
-    //lcd.print("DHW bur st: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+    Serial.print("DHW bur st: ");
+    Serial.print(ut);
+    Serial.println("     ");
     break;
   case 120:  //burner hours
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.burner_hours = ut;
-    //lcd.print("bur h: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+    //Serial.print("bur h: ");
+    //Serial.print(ut);
+    //Serial.print("     ");
     break;
   case 121:  //CH pump hours
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.CH_pump_hours = ut;
-    //lcd.print("CH p h: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+    //Serial.print("CH p h: ");
+    //Serial.print(ut);
+    //Serial.print("     ");
     break;
   case 122:  //DHW pump hours
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.DHW_pump_hours = ut;
-    //lcd.print("DHW p h: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+    //Serial.print("DHW p h: ");
+    //Serial.print(ut);
+    //Serial.print("     ");
     break;
   case 123:  //DHW burner hours
     ut = (unsigned int)data_value;  // don't care about decimal values
     extbuf.DHW_burner_hours = ut;
-    //lcd.print("DHW b h: ");
-    //lcd.print(ut);
-    //lcd.print("     ");
+    //Serial.print("DHW b h: ");
+    //Serial.print(ut);
+    //Serial.print("     ");
     break; 
   case 24:  // room actual temperature
     if (OT.isMaster()) {
-      float t = (float)data_value / 256;
-      //lcd.print("Room temp ");
-      //lcd.print(t);
-      if (data_value % 256 == 0) {
-        //lcd.print(".0");
-      }
-      //lcd.print("C");
+      buf.roomtemp = data_value;
+//      Serial.print("Room temp ");
+//      Serial.println(highByte(buf.roomtemp));
+//      Serial.println("C");
     }
     break;
   default:
-    //lcd.print("incorrect message ID   ");
+//    Serial.print("incorrect message ID   ");
+//    Serial.println(data_id);
     break;
 
   }  // switch  
