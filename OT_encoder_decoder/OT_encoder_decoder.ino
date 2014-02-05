@@ -43,16 +43,17 @@
 /* Include the U8glib library */
 #include "U8glib.h"
 /* Define the SPI Chip Select pin */
-#define CS_PIN 10
+#define CS_PIN (10)
+#define RESET (9)	// to reset the Ethernet module
 #define MASTER_OUTPUT_PIN (4)
 #define SLAVE_OUTPUT_PIN (5)
 #define OTPERIOD (996) //used a little trick to find mine, see below in loop
 
 #define MAX_BOILER_TEMP (80)
+#define MIN_BOILER_TEMP (35)
 #define REPORTING_PERIOD (30000) // in milliseconds
 // xively.com feed
-#define FEED    "1927562856"
-#define APIKEY  "fU3LIV4DesLb8zHqnZG8int9HOtrzysRcfjGfNcvhp6FbLE7"
+#include "xively.h"  //contains xively.com account settings
 //CHARACTER DEFINITIONS
 
 #define CHAR_CH    (0)
@@ -151,13 +152,12 @@ prog_char oth_error[] PROGMEM = "oth err";
 char lcd_status[9];
 
 // ethernet interface mac address, must be unique on the LAN
-byte mymac[] = { 0x74,0x69,0x69,0x2D,0x33,0x9 };
-
-//char website[] PROGMEM = "api.xively.com";
+static byte mymac[] = { 0x74,0x69,0x69,0x2D,0x33,0x9 };
 prog_char website[] PROGMEM = "api.xively.com";
 byte Ethernet::buffer[450];
 Stash stash;
 static byte session;
+byte res;
 unsigned long previousMillis = 0;
 unsigned long currentMillis;
 /* Timer2 reload value, globally available */
@@ -171,6 +171,8 @@ int y;
 int bits_sent = 0;
 
 byte flame = false;
+byte strategy =2;    // set the default strategy
+byte setpoint_history[10] = { MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP, MIN_BOILER_TEMP };  // set point for last 10 reporting periods
 
 byte bit_out = HIGH;
 boolean done = false;
@@ -181,6 +183,8 @@ typedef struct {
   unsigned int house;
   unsigned int device;
   byte temp;
+  byte setpoint;
+  byte reqtemp;
   byte CHtemp;
   byte returntemp;
   byte boilerstatus;
@@ -231,26 +235,16 @@ void setup() {
   Serial.print("freeMemory()=");
   Serial.println(freeMemory()); 
   // Set up Ethernet
-      
-  if (ether.begin(sizeof Ethernet::buffer, mymac) == 0) 
-    Serial.println( "Failed to access Ethernet controller");
-  if (!ether.dhcpSetup())
-    Serial.println("DHCP failed");
-
-  ether.printIp("IP:  ", ether.myip);
-  ether.printIp("GW:  ", ether.gwip);  
-  ether.printIp("DNS: ", ether.dnsip);  
-
-  if (!ether.dnsLookup(website))
-    Serial.println("DNS failed");
-    
-  ether.printIp("SRV: ", ether.hisip);
+  initialize_ethernet();    
   
+ 
 
  
   buf.house = 192;
   buf.device = 4;
   buf.temp = 0;
+  buf.reqtemp =25;
+  buf.setpoint = 0;
   buf.CHtemp = 0;
   buf.returntemp = 0;
   buf.boilerstatus = 0;
@@ -484,15 +478,15 @@ void loop() {
 //        }
     switch(error_reading_frame) {
   case 1:  
-	Serial.print("1");//bad data");
+//	Serial.print("1");//bad data");
 //      strcpy_P(lcd_status, bad_data);   
       break;
   case 2:
-        Serial.print("2");//ss bit error");
-	strcpy_P(lcd_status, ss_error);
+//        Serial.print("2");//ss bit error");
+//	strcpy_P(lcd_status, ss_error);
 	break;
   case 3:
-        Serial.print("3");//parity error");
+//        Serial.print("3");//parity error");
 //	strcpy_P(lcd_status, par_error);   
 	break;
   case 0:    // good frame
@@ -510,12 +504,39 @@ void loop() {
   currentMillis = millis();
   if(currentMillis - previousMillis > REPORTING_PERIOD) {
     previousMillis = currentMillis;
+    upload_stats();
+// calculate the temperature control point based on the current strategy    
+    Serial.println("Calculating strategy");
+    
+    switch(strategy) {
+      case 1:
+	smoothed();
+	break;
+      case 2:
+	distance();
+      case 0:
+      default:
+	nostrategy();
+    }
+  }
+
+  
+  }
+}  // end main loop
 
 
+
+void upload_stats() {
       // By using a separate stash,
       // we can determine the size of the generated message ahead of time
       stash.cleanup();
       byte sd = stash.create();
+      
+      if (res > 15){
+     	initialize_ethernet();	// if ethernet is away with the fairies reset it. 
+      }  
+      res ++;
+      
       if (buf.temp > 0) 
       {
 	stash.print("burner_temp,");
@@ -566,26 +587,57 @@ void loop() {
 
       // send the packet - this also releases all stash buffers once done
       session = ether.tcpSend();  
-  
       
-    const char* reply = ether.tcpReply(session);
-if (reply !=0){
-
-Serial.print("\nResponse received");
-}  
+      const char* reply = ether.tcpReply(session);
+      if (reply !=0){
+	res = 0;
+	Serial.print(reply);
+      }  
  
-    //HERE RESET CHTEMP, RETURNTEMP, BOILERSTATUS, TEMP
-    buf.CHtemp = 0;
-    buf.returntemp = 0;
-    buf.boilerstatus = 0;
-    buf.h2o = 0;
+      //HERE RESET CHTEMP, RETURNTEMP, BOILERSTATUS, TEMP
+      buf.CHtemp = 0;
+      buf.returntemp = 0;
+      buf.boilerstatus = 0;
+      buf.h2o = 0;
 
-    done = false;
-    StartInterrupts();
-  
+      done = false;
+      StartInterrupts();
+}
+
+void initialize_ethernet(void){
+   //Restart if needed
+   restart: 
+ 
+   //Reinitialize ethernet module
+   pinMode(5, OUTPUT);
+   Serial.println("Resetting Ethernet...");
+   //Serial.println("");
+   digitalWrite(RESET, LOW);
+   delay(500);
+   digitalWrite(RESET, HIGH);
+   delay(400);
+ 
+   if (ether.begin(sizeof Ethernet::buffer, mymac) == 0){ 
+     Serial.println( "Failed to access Ethernet controller");
+     goto restart;
    }
-  }
-}  // end main loop
+   if (!ether.dhcpSetup()){
+     Serial.println("DHCP failed");
+     goto restart;
+   }
+   if (!ether.dnsLookup(website)) {
+     Serial.println("DNS failed");
+    goto restart;
+   }
+   ether.printIp("IP:  ", ether.myip);
+   ether.printIp("GW:  ", ether.gwip);  
+   ether.printIp("DNS: ", ether.dnsip);  
+   ether.printIp("SRV: ", ether.hisip);
+ 
+ //reset init value
+ res = 0;
+ }
+
 
 
 //Draw LCD screen
@@ -613,11 +665,17 @@ void copyframe() {
   frame >>= 8; // strip off lowest byte
   MM1 = frame;
   
+  
+  // If controls have set a setpoint greater than 20, but have signalled no demand, because room is up to temperature
+  // then change signal to demand to keep the pump going to keep the radiators warm
+    if (OT.getDataId() == 0 && buf.reqtemp > 20 && !(MM2 & B00000010) && OT.isMaster()) {
+    MM3 = MM3 | B00000001;
+  }
+  
   if (OT.getDataId() == 1) {    // Temp Control set point
     if (OT.isMaster()) {
-      MM3 = 55;  // Force temp to 55 for testing
+      MM3 = buf.setpoint;  // Tell the boiler what temperature to set according to current strategy
       MM4 = 0;
-      parity();   // check parity
     }
    }
     
@@ -627,15 +685,13 @@ void copyframe() {
   // but never asks for return temp
   if (OT.getDataId() == 17 && OT.isMaster()) {
     MM2 = 28;            //set id type to returntemp
-    parity();   // check parity
   }
   if (OT.getDataId() == 28 && !OT.isMaster()) {
     MM2 = 17;            //set id type back to modulation
     MM1 = B01110000;	// send data invalid
       //recalculate parity 
-    parity();   // check parity
    }
-  
+  parity();   // check parity
   StartInterrupts();
 }
 
@@ -674,6 +730,7 @@ void display_frame() {
 
   unsigned int ut;
   unsigned int t;
+  /*
 Serial.print("from ");
 if (OT.isMaster()) {
   Serial.print("master ");
@@ -686,6 +743,7 @@ Serial.print("   data ID ");
 Serial.print(data_id);
 Serial.print("   data value ");
 Serial.println(data_value);
+*/
 
 
   switch(data_id) {
@@ -713,11 +771,13 @@ Serial.println(data_value);
 //    Serial.println((byte)t);
     break;
   case 1:  // Control setpoint
-    if (OT.isMaster()) { // only interested in slave status
-      break;
-    }
     t = data_value / 256;  // don't care about decimal values
+    if (OT.isMaster()) { 
+      buf.reqtemp = (byte)t;
+    }
+    else {
     buf.temp = (byte)t;
+    }
 //    Serial.print("set burner to ");
 //    Serial.print(t);
 //    Serial.println("C");
@@ -754,9 +814,9 @@ Serial.println(data_value);
     break;
    case 20:  //Date-Time
     t = data_value / 256;  // don't care about decimal values
-    Serial.print("Date ");
-    Serial.print(data_value);
-    Serial.println("     ");
+//    Serial.print("Date ");
+//    Serial.print(data_value);
+//    Serial.println("     ");
     break;   
   case 25:  //CH temp
     if (OT.isMaster()) { // only interested in slave status
@@ -850,4 +910,64 @@ Serial.println(data_value);
     break;
 
   }  // switch  
+}
+
+
+// This section contains a number of heating strategies that can be selected.
+// Strategy 'smoothed'
+// -----------
+// Smooth Thermostat set point - Allow the room thermostat to shoose a control setpoint,
+// but smooth the set point to provide more gradual operation.
+// Smoothing takes the average of the requested setpoint for the last 10 reporting periods (5 min)
+
+// Strategy 'nostrategy'
+// -----------
+// Allows the room thermostat to shoose the control setpoint,
+// but only updates it once every reporting period so rapid changes are not communicated to the boiler.
+
+
+
+// Room control setting   buf.roomset
+ // Current setpoint reported by slave   buf.temp
+ // Setpoint given to slave buf.setpoint
+ // Requested setpoint  buf.reqtemp
+ // Current water temperature  buf.CHtemp
+
+
+void nostrategy() {
+  
+// Tell the slave to set water temperature to whatever wall controls request
+// Since strategy is set every 30 seconds so more frequent change requests will be ignored
+// so this strategy is not QUITE transparent  
+  buf.setpoint = buf.reqtemp;
+}
+
+// Tell the slave to set water temperature to whatever wall controls request
+// averaged over the last 10 reporting periods (5 mins)
+// This strategy should avoid sudden temperature changes 
+void smoothed() {
+  byte i;
+  unsigned int x = buf.reqtemp;
+  for ( i =9; i>0; i-- ) {
+    x = x + setpoint_history[i];
+    Serial.print("   ");
+    Serial.print(x);
+    setpoint_history[i] = setpoint_history[i-1]; 
+  }
+  if (buf.reqtemp < 30) {
+    setpoint_history[0] = MIN_BOILER_TEMP;  // set minimum flow temperature
+  } else {
+    setpoint_history[0] = buf.reqtemp;
+  }
+  buf.setpoint = x/10;	// average of current point and last 9
+}
+
+
+//If the distance between the desired room temperature is more than half a degree C less than the actual temperature,
+// increase the water temperature to 55 deg
+void distance() {
+  if ( buf.roomtemp + 128 <  buf.roomset ) {
+    buf.reqtemp = 55;
+  }
+  smoothed();
 }
