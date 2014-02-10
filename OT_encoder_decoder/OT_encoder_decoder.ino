@@ -53,6 +53,8 @@
 #define MIN_BOILER_TEMP (35)
 #define REPORTING_PERIOD (30000) // in milliseconds
 // xively.com feed
+//#define FEED    "MY FEED"
+//#define APIKEY  "MY API"
 #include "xively.h"  //contains xively.com account settings
 //CHARACTER DEFINITIONS
 
@@ -153,6 +155,11 @@ char lcd_status[9];
 
 // ethernet interface mac address, must be unique on the LAN
 static byte mymac[] = { 0x74,0x69,0x69,0x2D,0x33,0x9 };
+// ethernet interface ip address
+static byte myip[] = { 192,168,1,38 };
+// gateway ip address
+static byte gwip[] = { 192,168,1,254 };
+static byte hisip[] = { 216, 52, 233, 120 };
 prog_char website[] PROGMEM = "api.xively.com";
 byte Ethernet::buffer[450];
 Stash stash;
@@ -229,12 +236,15 @@ void setup() {
   
   // assign output pins
   pinMode( MASTER_OUTPUT_PIN, OUTPUT);
-  pinMode( SLAVE_OUTPUT_PIN, OUTPUT);
+  digitalWrite(MASTER_OUTPUT_PIN, HIGH);
+  pinMode( SLAVE_OUTPUT_PIN, OUTPUT);		// idle high
+  digitalWrite(SLAVE_OUTPUT_PIN, HIGH);
     
   Serial.begin(57600);
   Serial.print("freeMemory()=");
   Serial.println(freeMemory()); 
   // Set up Ethernet
+  pinMode(RESET, OUTPUT);
   initialize_ethernet();    
   
  
@@ -506,7 +516,7 @@ void loop() {
     previousMillis = currentMillis;
     upload_stats();
 // calculate the temperature control point based on the current strategy    
-    Serial.println("Calculating strategy");
+//    Serial.println("Calculating strategy");
     
     switch(strategy) {
       case 1:
@@ -532,10 +542,10 @@ void upload_stats() {
       stash.cleanup();
       byte sd = stash.create();
       
-      if (res > 15){
-     	initialize_ethernet();	// if ethernet is away with the fairies reset it. 
-      }  
-      res ++;
+//      if (res > 15){
+//     	initialize_ethernet();	// if ethernet is away with the fairies reset it. 
+//      }  
+//      res ++;
       
       if (buf.temp > 0) 
       {
@@ -592,7 +602,10 @@ void upload_stats() {
       if (reply !=0){
 	res = 0;
 	Serial.print(reply);
-      }  
+//      }  else {
+//          Serial.print("freeMemory()=");
+//          Serial.println(freeMemory()); 
+      }
  
       //HERE RESET CHTEMP, RETURNTEMP, BOILERSTATUS, TEMP
       buf.CHtemp = 0;
@@ -609,29 +622,30 @@ void initialize_ethernet(void){
    restart: 
  
    //Reinitialize ethernet module
-   pinMode(5, OUTPUT);
    Serial.println("Resetting Ethernet...");
-   //Serial.println("");
    digitalWrite(RESET, LOW);
-   delay(500);
+   delay(20);
    digitalWrite(RESET, HIGH);
-   delay(400);
- 
+   delay(20);
    if (ether.begin(sizeof Ethernet::buffer, mymac) == 0){ 
      Serial.println( "Failed to access Ethernet controller");
      goto restart;
    }
-   if (!ether.dhcpSetup()){
-     Serial.println("DHCP failed");
-     goto restart;
-   }
-   if (!ether.dnsLookup(website)) {
-     Serial.println("DNS failed");
-    goto restart;
-   }
+   
+   ether.staticSetup(myip, gwip);
+   ether.copyIp(ether.hisip, hisip);
+   
+//   if (!ether.dhcpSetup()){
+//     Serial.println("DHCP failed");
+//     goto restart;
+//   }
+//   if (!ether.dnsLookup(website)) {
+//     Serial.println("DNS failed");
+//    goto restart;
+//   }
    ether.printIp("IP:  ", ether.myip);
    ether.printIp("GW:  ", ether.gwip);  
-   ether.printIp("DNS: ", ether.dnsip);  
+//   ether.printIp("DNS: ", ether.dnsip);  
    ether.printIp("SRV: ", ether.hisip);
  
  //reset init value
@@ -668,9 +682,9 @@ void copyframe() {
   
   // If controls have set a setpoint greater than 20, but have signalled no demand, because room is up to temperature
   // then change signal to demand to keep the pump going to keep the radiators warm
-    if (OT.getDataId() == 0 && buf.reqtemp > 20 && !(MM2 & B00000010) && OT.isMaster()) {
-    MM3 = MM3 | B00000001;
-  }
+ //   if (OT.getDataId() == 0 && buf.reqtemp > 20 && !(MM2 & B00000010) && OT.isMaster()) {
+ //   MM3 = MM3 | B00000001;
+ // }
   
   if (OT.getDataId() == 1) {    // Temp Control set point
     if (OT.isMaster()) {
@@ -678,19 +692,21 @@ void copyframe() {
       MM4 = 0;
     }
    }
-    
-    
-  // if ID=17 (modulation) change it to 28 (ret Temp)
-  // controls always ask for modulation which boiler does not support
-  // but never asks for return temp
-  if (OT.getDataId() == 17 && OT.isMaster()) {
-    MM2 = 28;            //set id type to returntemp
-  }
-  if (OT.getDataId() == 28 && !OT.isMaster()) {
-    MM2 = 17;            //set id type back to modulation
-    MM1 = B01110000;	// send data invalid
-      //recalculate parity 
-   }
+   
+   
+   // without this section Remaha controls hangs when updating time/date
+   // that Intergas boiler ignores
+  if (OT.getDataId() == 20 && OT.isMaster() ) {    // If controller sends a date set command echo it back again with a NACK
+    output_pin = MASTER_OUTPUT_PIN;
+
+    MM1 = B01110000;
+    MM3 = 0x53;
+    MM4 = 0xc8;
+    delay(50);
+//    Serial.println("ignore");
+//    StartInterrupts();
+    }
+   
   parity();   // check parity
   StartInterrupts();
 }
@@ -730,7 +746,7 @@ void display_frame() {
 
   unsigned int ut;
   unsigned int t;
-  /*
+  
 Serial.print("from ");
 if (OT.isMaster()) {
   Serial.print("master ");
@@ -743,7 +759,7 @@ Serial.print("   data ID ");
 Serial.print(data_id);
 Serial.print("   data value ");
 Serial.println(data_value);
-*/
+
 
 
   switch(data_id) {
@@ -817,7 +833,15 @@ Serial.println(data_value);
 //    Serial.print("Date ");
 //    Serial.print(data_value);
 //    Serial.println("     ");
-    break;   
+    break;  
+   case 24:  // room actual temperature
+    if (OT.isMaster()) {
+      buf.roomtemp = data_value;
+//      Serial.print("Room temp ");
+//      Serial.println(highByte(buf.roomtemp));
+//      Serial.println("C");
+    }
+    break;
   case 25:  //CH temp
     if (OT.isMaster()) { // only interested in slave status
       break;
@@ -896,14 +920,6 @@ Serial.println(data_value);
     //Serial.print(ut);
     //Serial.print("     ");
     break; 
-  case 24:  // room actual temperature
-    if (OT.isMaster()) {
-      buf.roomtemp = data_value;
-//      Serial.print("Room temp ");
-//      Serial.println(highByte(buf.roomtemp));
-//      Serial.println("C");
-    }
-    break;
   default:
 //    Serial.print("incorrect message ID   ");
 //    Serial.println(data_id);
@@ -950,8 +966,8 @@ void smoothed() {
   unsigned int x = buf.reqtemp;
   for ( i =9; i>0; i-- ) {
     x = x + setpoint_history[i];
-    Serial.print("   ");
-    Serial.print(x);
+ //   Serial.print("   ");
+ //   Serial.print(x);
     setpoint_history[i] = setpoint_history[i-1]; 
   }
   if (buf.reqtemp < 30) {
@@ -966,8 +982,8 @@ void smoothed() {
 //If the distance between the desired room temperature is more than half a degree C less than the actual temperature,
 // increase the water temperature to 55 deg
 void distance() {
-  if ( buf.roomtemp + 128 <  buf.roomset ) {
+  if ( buf.roomtemp + 128 <  buf.roomset  && buf.reqtemp < 55 ) {
     buf.reqtemp = 55;
   }
-  smoothed();
+    smoothed();
 }
